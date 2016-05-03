@@ -1,0 +1,14 @@
+{
+  "name": "agar.io",
+  "version": "1.0.0",
+  "description": "",
+  "scripts": {
+    "main": "node --harmony node_modules/babel/bin/babel-node.js main.es6.js"
+  },
+  "author": "gdg38, asm278",
+  "license": "ISC",
+  "dependencies": {
+    "babel": "^5.8.23",
+    "lodash": "^3.10.1"
+  }
+}
