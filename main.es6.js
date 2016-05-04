@@ -1,135 +1,197 @@
+const username = "CS6700";
+
 const _ = require('lodash');
+const AgarioClient = require('agario-client'); //Use next line in your scripts
+const RL = require('./rl.js'); //reinforcejs
+//Load vector utilities
+const Vec = require('./vector').Vec;
+const line_intersect = require('./vector').line_intersect;
+const line_point_intersect = require('./vector').line_point_intersect;
 
-//this is an example of API usage
-var http = require('http');
-var AgarioClient = require('agario-client'); //Use next line in your scripts
-//var AgarioClient = require('agario-client'); //Use this in your scripts
 
-var region = 'EU-London'; //server region to request
-var client = new AgarioClient('worker'); //create new client and call it "worker" (not nickname)
-var interval_id = 0; //here we will store setInterval's ID
-
+//AGAR CLIENT STATE
+const client = new AgarioClient('worker'); //create new client and call it "worker" (not nickname)
 client.debug = 1; //setting debug to 1 (available 0-5)
-client.auth_token = ''; //you can put here your auth token to authorize client. Check in README.md how to get it
-
-//here adding custom properties/events example shown
-AgarioClient.prototype.addFriend = function(ball_id) { //adding client.addFriend(ball_id) function
-    var ball = client.balls[ball_id];
-    ball.is_friend = true; //set ball.is_friend to true
-    ball.on('destroy', function() { //when this friend will be destroyed
-        client.emit('friendLost', ball); //emit friendEaten event
-    });
-    client.emit('friendAdded', ball_id); //emit friendAdded event
+let interval_id = 0; //here we will store setInterval's ID
+let map; //stupid client doesn't remember map sizes but fires event..........
+//
+const targetTypes = {
+  NONE: 0,
+  CELL: 1,
+  VIRUS: 2,
+  WALL: 3
+};
+const actionTypes = {
+  UP: 0,
+  LEFT: 1,
+  DOWN: 2,
+  RIGHT: 3
 };
 
-AgarioClient.Ball.prototype.isMyFriend = function() { //adding ball.isMyFriend() function
-    return this.is_friend == true; //if ball is_friend is true, then true will be returned
+const sensorCount = 12;
+const sensorRange = 500;
+const sensors = _.map(_.range(sensorCount), (i, index, all) => {
+  const rad = i * ((2 * Math.PI) / all.length);
+  return new Vec(Math.cos(rad) * sensorRange, Math.sin(rad) * sensorRange);
+});
+
+//REINFORCEJS State
+let agent;
+
+//Setup Functions
+const agarSetup = () => {
+  client.on('lostMyBalls', () => {
+      client.log('Died, respawning');
+      client.spawn(username);
+  });
+
+  client.on('connected', () => { //when we connected to server
+      client.log('Connected, spawning');
+      client.spawn(username); //spawning new ball
+      interval_id = setInterval(onTick, 50); //we will search for target to eat every 100ms
+  });
+
+  client.on('reset', () => { //when client clears everything (connection lost?)
+      clearInterval(interval_id);
+  });
+
+  client.on('connectionError', (e) => {
+      client.log('Connection failed with reason: ' + e);
+      client.log('Server address set to: ' + client.server + ' please check if this is correct and working address');
+  });
+
+  client.on('mapSizeLoad', (minX, minY, maxX, maxY) => {
+    map = {minX, maxX, minY, maxY};
+  });
 };
 
-client.on('ballAppear', function(ball_id) { //when we meet somebody
-    var ball = client.balls[ball_id];
-    if(ball.mine) return; //this is my ball
-    if(ball.isMyFriend()) return; //this ball is already a friend
-    if(ball.name == 'agario-client') { //if ball have name 'agario-client'
-        client.addFriend(ball_id); //add it to friends
+const agarStart = () => {
+  const srv = "127.0.0.1:9158";
+  console.log('Connecting to ' + srv);
+  client.connect('ws://' + srv); //do not forget to add ws://
+};
+
+const reinforceSetup = () => {
+  const env = {
+    getNumStates: () => sensorCount * 3 + 2,
+    getMaxNumActions: () => 4
+  };
+
+  const spec = {
+    alpha: 0.005,
+    epsilon: 0.2,
+    experience_add_every: 5,
+    experience_size: 10000,
+    gamma: 0.9,
+    learning_steps_per_iteration: 5,
+    num_hidden_units: 100,
+    tderror_clamp: 1,
+    update: "qlearn"
+  };
+
+  agent = new RL.DQNAgent(env, spec);
+};
+
+// MAIN HELPER FUNCTIONS
+const sees = (sensor, position, ball) => {
+  const res = line_point_intersect(position, position.add(sensor), new Vec(ball.x, ball.y), ball.size);
+  if (_.isObject(res)) {
+    return res.up.dist_from(position);
+  } else {
+    return false;
+  }
+};
+
+const getCurrentState = () => {
+  let myCt = client.my_balls.length;
+  if (myCt === 0) {
+    return false;
+  }
+  let myX = 0;
+  let myY = 0;
+  let mySize = 0;
+  for (const b of client.my_balls) {
+    const ball = client.balls[b];
+    myX += ball.x;
+    myY += ball.y;
+    mySize += ball.size;
+  }
+  const me = {
+    totalSize: mySize,
+    totalBalls: myCt,
+    pAvg: new Vec(myX/myCt, myY/myCt)
+  };
+
+  const sensorDetections = _.map(sensors, () => {
+    return {
+      dist: sensorRange,
+      targetType: targetTypes.NONE,
+      targetSize: -1
+    };
+  });
+
+  for (const ball in client.balls) {
+    if (ball.visible && !ball.mine && !ball.destroyed) {
+      for (let i=0; i<sensors.length; i++) {
+        const seen = sees(sensors[i], me.pAvg, ball);
+        if (_.isNumber(seen) && seen < sensorDetections[i].dist) {
+          sensorDetections[i] = {
+            dist: seen,
+            targetType: ball.virus ? targetTypes.VIRUS : targetTypes.CELL,
+            targetSize: ball.size
+          };
+        }
+      }
     }
-});
+  }
 
-client.on('friendLost', function(friend) { //on friendLost event
-    client.log('I lost my friend: ' + friend);
-});
+  return {
+    score: client.score,
+    me,
+    sensorDetections
+  };
+};
 
-client.on('friendAdded', function(friend_id) { //on friendEaten event
-    var friend = client.balls[friend_id];
-    client.log('Found new friend: ' + friend + '!');
-});
-//end of adding custom properties/events example
+const serialize = (state) => {
+  const me = [state.me.totalSize, state.me.totalBalls];
+  const sensors = _.flatten(_.map(state.sensorDetections, (sd) => {
+    return [sd.dist, sd.targetType, sd.targetSize];
+  }));
+  return me.concat(sensors);
+};
 
-client.on('leaderBoardUpdate', function(old_highlights, highlights, old_names, names) { //when we receive leaders list.
-    client.log('leaders on server: ' + names.join(', '));
-});
 
-client.on('mineBallDestroy', function(ball_id, reason) { //when my ball destroyed
-    if(reason.by) {
-        client.log(client.balls[reason.by] + ' ate my ball');
+// MAIN LOOP
+let prevScore = null;
+const onTick = () => {
+  const state = getCurrentState();
+  if (!_.isObject(state)) {
+    if (_.isNumber(prevScore)) {
+      agent.learn(-prevScore);
     }
+    prevScore = null;
+    return;
+  }
+  if (_.isNumber(prevScore)) {
+    agent.learn(state.score - prevScore);
+  }
 
-    if(reason.reason == 'merge') {
-        client.log('my ball ' + ball_id + ' merged with my other ball, now i have ' + client.my_balls.length + ' balls');
-    }else{
-        client.log('i lost my ball ' + ball_id + ', ' + client.my_balls.length + ' balls left');
-    }
-});
+  const action = agent.act(serialize(state))
+  let moveTo;
+  if (action === actionTypes.UP) {
+    moveTo = new Vec(state.me.pAvg.x, state.me.pAvg.y + 500);
+  } else if (action === actionTypes.RIGHT) {
+    moveTo = new Vec(state.me.pAvg.x + 500, state.me.pAvg.y);
+  } else if (action === actionTypes.DOWN) {
+    moveTo = new Vec(state.me.pAvg.x, state.me.pAvg.y - 500);
+  } else if (action === actionTypes.LEFT) {
+    moveTo = new Vec(state.me.pAvg.x - 500, state.me.pAvg.y);
+  }
+  client.moveTo(moveTo.x, moveTo.y);
+  prevScore = state.score;
+};
 
-client.on('myNewBall', function(ball_id) { //when i got new ball
-    client.log('my new ball ' + ball_id + ', total ' + client.my_balls.length);
-});
-
-client.on('lostMyBalls', function() { //when i lost all my balls
-    client.log('lost all my balls, respawning');
-    client.spawn('agario-client'); //spawning new ball with nickname "agario-client"
-});
-
-client.on('somebodyAteSomething', function(eater_ball, eaten_ball) { //when some ball ate some ball
-    var ball = client.balls[eater_ball]; //get eater ball
-    if(!ball) return; //if we don't know than ball, we don't care
-    if(!ball.mine) return; //if it's not our ball, we don't care
-    client.log('I ate ' + eaten_ball + ', my new size is ' + ball.size);
-});
-
-client.on('experienceUpdate', function(level, current_exp, need_exp) { //if facebook key used and server sent exp info
-    client.log('Experience update: Current level is ' + level + ' and experience is ' + current_exp + '/' + need_exp);
-});
-
-client.on('connected', function() { //when we connected to server
-    client.log('spawning');
-    client.spawn('agario-client'); //spawning new ball
-    interval_id = setInterval(recalculateTarget, 100); //we will search for target to eat every 100ms
-});
-
-client.on('connectionError', function(e) {
-    client.log('Connection failed with reason: ' + e);
-    client.log('Server address set to: ' + client.server + ' please check if this is correct and working address');
-});
-
-client.on('reset', function() { //when client clears everything (connection lost?)
-    clearInterval(interval_id);
-});
-
-function recalculateTarget() { //this is all our example logic
-    var candidate_ball = null; //first we don't have candidate to eat
-    var candidate_distance = 0;
-    var my_ball = client.balls[ client.my_balls[0] ]; //we get our first ball. We don't care if there more then one, its just example.
-    if(!my_ball) return; //if our ball not spawned yet then we abort. We will come back here in 100ms later
-
-    for(var ball_id in client.balls) { //we go through all balls we know about
-        var ball = client.balls[ball_id];
-        if(ball.virus) continue; //if ball is a virus (green non edible thing) then we skip it
-        if(!ball.visible) continue; //if ball is not on our screen (field of view) then we skip it
-        if(ball.mine) continue; //if ball is our ball - then we skip it
-        if(ball.isMyFriend()) continue; //this is my friend, ignore him (implemented by custom property)
-        if(ball.size/my_ball.size > 0.5) continue; //if ball is bigger than 50% of our size - then we skip it
-        var distance = getDistanceBetweenBalls(ball, my_ball); //we calculate distances between our ball and candidate
-        if(candidate_ball && distance > candidate_distance) continue; //if we do have some candidate and distance to it smaller, than distance to this ball, we skip it
-
-        candidate_ball = ball; //we found new candidate and we record him
-        candidate_distance = getDistanceBetweenBalls(ball, my_ball); //we record distance to him to compare it with other balls
-    }
-    if(!candidate_ball) return; //if we didn't find any candidate, we abort. We will come back here in 100ms later
-
-    client.log('closest ' + candidate_ball + ', distance ' + candidate_distance);
-    client.moveTo(candidate_ball.x, candidate_ball.y); //we send move command to move to food's coordinates
-}
-
-function getDistanceBetweenBalls(ball_1, ball_2) { //this calculates distance between 2 balls
-    return Math.sqrt( Math.pow( ball_1.x - ball_2.x, 2) + Math.pow( ball_2.y - ball_1.y, 2) );
-}
-
-// console.log('Requesting server in region ' + region);
-// AgarioClient.servers.getFFAServer({region: region}, function(srv) { //requesting FFA server
-//     if(!srv.server) return console.log('Failed to request server (error=' + srv.error + ', error_source=' + srv.error_source + ')');
-
-// });
-var srv = "127.0.0.1:9158";
-console.log('Connecting to ' + srv);
-client.connect('ws://' + srv); //do not forget to add ws://
+//START
+agarSetup();
+reinforceSetup();
+agarStart();
