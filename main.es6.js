@@ -1,5 +1,5 @@
 const username = "CS6700";
-
+const fs = require('fs');
 const _ = require('lodash');
 const AgarioClient = require('agario-client'); //Use next line in your scripts
 const RL = require('./rl.js'); //reinforcejs
@@ -28,7 +28,7 @@ const actionTypes = {
   RIGHT: 3
 };
 
-const sensorCount = 12;
+const sensorCount = 36;
 const sensorRange = 500;
 const sensors = _.map(_.range(sensorCount), (i, index, all) => {
   const rad = i * ((2 * Math.PI) / all.length);
@@ -48,7 +48,7 @@ const agarSetup = () => {
   client.on('connected', () => { //when we connected to server
       client.log('Connected, spawning');
       client.spawn(username); //spawning new ball
-      interval_id = setInterval(onTick, 50); //we will search for target to eat every 100ms
+      interval_id = setInterval(onTick, 100); //we will search for target to eat every 100ms
   });
 
   client.on('reset', () => { //when client clears everything (connection lost?)
@@ -71,16 +71,16 @@ const agarStart = () => {
   client.connect('ws://' + srv); //do not forget to add ws://
 };
 
-const reinforceSetup = () => {
+const reinforceSetup = (model) => {
   const env = {
-    getNumStates: () => sensorCount * 3 + 2,
+    getNumStates: () => sensorCount * 3 + 4,
     getMaxNumActions: () => 4
   };
 
   const spec = {
     alpha: 0.005,
     epsilon: 0.2,
-    experience_add_every: 5,
+    experience_add_every: 2,
     experience_size: 10000,
     gamma: 0.9,
     learning_steps_per_iteration: 5,
@@ -90,6 +90,9 @@ const reinforceSetup = () => {
   };
 
   agent = new RL.DQNAgent(env, spec);
+  if (_.isObject(model)) {
+    agent.fromJSON(model);
+  }
 };
 
 // MAIN HELPER FUNCTIONS
@@ -130,7 +133,8 @@ const getCurrentState = () => {
     };
   });
 
-  for (const ball in client.balls) {
+  for (const b in client.balls) {
+    const ball = client.balls[b];
     if (ball.visible && !ball.mine && !ball.destroyed) {
       for (let i=0; i<sensors.length; i++) {
         const seen = sees(sensors[i], me.pAvg, ball);
@@ -145,6 +149,33 @@ const getCurrentState = () => {
     }
   }
 
+  //do walls
+  for (let i=0; i< sensors.length; i++) {
+    const sensor = sensors[i];
+    const pos = sensor.add(me.pAvg);
+    let wallDist = sensorRange + 1;
+    if (pos.x < map.minX) {
+      wallDist = Math.min(wallDist, Math.abs(sensorRange * (1 - ((map.minX - pos.x) / sensor.x))));
+    }
+    if (pos.y < map.minY) {
+      wallDist = Math.min(wallDist, Math.abs(sensorRange * (1 - ((map.minY - pos.y) / sensor.y))));
+    }
+    if (pos.x > map.maxX) {
+      wallDist = Math.min(wallDist, Math.abs(sensorRange * (1 - ((pos.x - map.maxX) / sensor.x))));
+    }
+    if (pos.y > map.maxY) {
+      wallDist = Math.min(wallDist, Math.abs(sensorRange * (1 - ((pos.y - map.maxY) / sensor.y))));
+    }
+
+    if (wallDist <= sensorDetections[i].dist) {
+      sensorDetections[i] = {
+        dist: wallDist,
+        targetType: targetTypes.WALL,
+        targetSize: -1
+      };
+    }
+  }
+
   return {
     score: client.score,
     me,
@@ -152,8 +183,8 @@ const getCurrentState = () => {
   };
 };
 
-const serialize = (state) => {
-  const me = [state.me.totalSize, state.me.totalBalls];
+const serialize = (state, velocity) => {
+  const me = [state.me.totalSize, state.me.totalBalls, velocity.x, velocity.y];
   const sensors = _.flatten(_.map(state.sensorDetections, (sd) => {
     return [sd.dist, sd.targetType, sd.targetSize];
   }));
@@ -163,20 +194,30 @@ const serialize = (state) => {
 
 // MAIN LOOP
 let prevScore = null;
+let prevPos = null;
 const onTick = () => {
+  const startTime = Date.now();
   const state = getCurrentState();
   if (!_.isObject(state)) {
     if (_.isNumber(prevScore)) {
+      console.log("---------------Dead, reward: " + (-prevScore) + "--------------");
       agent.learn(-prevScore);
+      //clear experience
+      agent.exp = []; // experience
+      agent.expi = 0; // where to insert
+      agent.t = 0;
     }
     prevScore = null;
     return;
   }
-  if (_.isNumber(prevScore)) {
-    agent.learn(state.score - prevScore);
+  const reward = _.isNumber(prevScore) ? state.score - prevScore : null;
+  if (_.isNumber(reward)) {
+    agent.learn(reward);
   }
 
-  const action = agent.act(serialize(state))
+  const velocity = _.isObject(prevPos) ? new Vec(state.me.pAvg.x - prevPos.x, state.me.pAvg.y - prevPos.x) : new Vec(0,0);
+  const prevPos = state.me.pAvg;
+  const action = agent.act(serialize(state, velocity));
   let moveTo;
   if (action === actionTypes.UP) {
     moveTo = new Vec(state.me.pAvg.x, state.me.pAvg.y + 500);
@@ -188,10 +229,34 @@ const onTick = () => {
     moveTo = new Vec(state.me.pAvg.x - 500, state.me.pAvg.y);
   }
   client.moveTo(moveTo.x, moveTo.y);
+  const closest = _.min(state.sensorDetections, (sd) => sd.dist);
+  console.log({
+    action: action,
+    reward: reward,
+    time: Date.now() - startTime,
+    dist: closest.dist
+  });
   prevScore = state.score;
 };
 
+const startSave = () => {
+  const start = Date.now();
+  const save = () => {
+    fs.writeFile("./models/model_"+Math.floor((Date.now() - start)/60000) + ".json", JSON.stringify(agent.toJSON()));
+    setTimeout(save, 600000);//10 min
+  }
+  save();
+};
+
+
 //START
 agarSetup();
-reinforceSetup();
+const args = process.argv.slice(2);
+if (_.isString(args[0])) {
+  const model = JSON.parse(fs.readFileSync(args[0]).toString());
+  reinforceSetup(model);
+} else {
+  reinforceSetup();
+}
 agarStart();
+startSave();
