@@ -253,6 +253,7 @@ const startSave = () => {
 agarSetup();
 const args = process.argv.slice(2);
 if (_.isString(args[0])) {
+  console.log("Loading model: " + args[0]);
   const model = JSON.parse(fs.readFileSync(args[0]).toString());
   reinforceSetup(model);
 } else {
